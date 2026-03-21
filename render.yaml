@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mc-mod-compiler
+    env: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+    # Render free tier: 512MB RAM, shared CPU
+    # First Gradle build downloads ~500MB deps (cached after)
