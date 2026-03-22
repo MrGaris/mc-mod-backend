@@ -40,55 +40,55 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'MC Mod Compiler', java: getJavaVersion() });
 });
 
-// ── Groq proxy — Qwen3-32b з режимом думання ─────────────────────────
+// ── OpenRouter proxy — Qwen3 Coder ───────────────────────────────────
 app.post('/generate', async (req, res) => {
   const { system, user } = req.body;
   if (!system || !user) return res.status(400).json({ error: 'Missing system or user' });
 
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'GROQ_API_KEY not set on server' });
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'API key not set on server' });
 
   const startTime = Date.now();
 
   try {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + apiKey
+        'Authorization': 'Bearer ' + apiKey,
+        'HTTP-Referer': 'https://mc-mod-generator.com',
+        'X-Title': 'MC Mod Generator'
       },
       body: JSON.stringify({
-        model: 'qwen/qwen3-32b',
+        model: 'qwen/qwen3-coder:free',
         messages: [
           { role: 'system', content: system },
           { role: 'user',   content: user   }
         ],
+        max_tokens: 16000,
         temperature: 0.6,
-        max_completion_tokens: 16000,
-        top_p: 0.95,
-        reasoning_effort: 'default'
-        // stream: false — ми не стрімимо, чекаємо повну відповідь
+        top_p: 0.95
       }),
-      signal: AbortSignal.timeout(180000) // 3 хв для reasoning моделі
+      signal: AbortSignal.timeout(300000) // 5 хв
     });
 
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
-      throw new Error(e.error?.message || 'Groq HTTP ' + r.status);
+      throw new Error(e.error?.message || 'OpenRouter HTTP ' + r.status);
     }
 
     const data = await r.json();
 
-    // Прибираємо <think>...</think> блоки — юзеру потрібен тільки код
+    // Strip <think>...</think> blocks
     if (data.choices?.[0]?.message?.content) {
       data.choices[0].message.content = data.choices[0].message.content
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .trim();
     }
 
-    // Мінімум 10 секунд
+    // Мінімум 5 секунд
     const elapsed = Date.now() - startTime;
-    if (elapsed < 10000) await sleep(10000 - elapsed);
+    if (elapsed < 5000) await sleep(5000 - elapsed);
 
     console.log(`[generate] Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
     res.json(data);
@@ -172,8 +172,8 @@ app.post('/compile', async (req, res) => {
 
 // ── AI Error Fixer ────────────────────────────────────────────────────
 async function aiFixErrors(files, errorLog, loader, mcVersion) {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) throw new Error('GROQ_API_KEY not set');
+  const apiKey = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('API key not set');
 
   const javaFiles = Object.entries(files)
     .filter(([p]) => p.endsWith('.java'))
@@ -192,18 +192,21 @@ Rules: fix every error, keep same functionality, use only real ${loader} ${mcVer
 
   const usr = `BUILD ERRORS:\n${errorLines}\n\nLAST ERROR LOG:\n${errorLog.slice(-2000)}\n\nSOURCE FILES:\n${javaFiles}`;
 
-  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + apiKey,
+      'HTTP-Referer': 'https://mc-mod-generator.com',
+      'X-Title': 'MC Mod Generator'
+    },
     body: JSON.stringify({
-      model: 'qwen/qwen3-32b',
+      model: 'qwen/qwen3-coder:free',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-      temperature: 0.6,
-      max_completion_tokens: 16000,
-      top_p: 0.95,
-      reasoning_effort: 'default'
+      max_tokens: 16000,
+      temperature: 0.3
     }),
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(300000)
   });
 
   if (!r.ok) throw new Error('Groq API error: ' + r.status);
