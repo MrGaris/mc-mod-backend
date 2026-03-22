@@ -4,10 +4,10 @@ FROM eclipse-temurin:21-jdk-jammy
 RUN apt-get update && apt-get install -y curl unzip && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
-    curl -fsSL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip && \
+    curl -fsSL https://services.gradle.org/distributions/gradle-8.11-bin.zip -o /tmp/gradle.zip && \
     unzip /tmp/gradle.zip -d /opt && \
     rm /tmp/gradle.zip && \
-    ln -s /opt/gradle-8.9/bin/gradle /usr/local/bin/gradle && \
+    ln -s /opt/gradle-8.11/bin/gradle /usr/local/bin/gradle && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
