@@ -51,7 +51,7 @@ async function callAI(sys, usr) {
     method: 'POST',
     headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+key,
                'HTTP-Referer':'https://mc-mod-generator.com', 'X-Title':'MC Mod Generator' },
-    body: JSON.stringify({ model:'qwen/qwen3-coder:free',
+    body: JSON.stringify({ model:'qwen/qwen3-coder-480b-a35b:free',
       messages:[{role:'system',content:sys},{role:'user',content:usr}],
       max_tokens:16000, temperature:0.3 }),
     signal: AbortSignal.timeout(300000)
@@ -68,8 +68,6 @@ app.post('/generate', async (req, res) => {
   const t = Date.now();
   try {
     const content = await callAI(system, user);
-    const elapsed = Date.now()-t;
-    if (elapsed < 5000) await sleep(5000-elapsed);
     console.log(`[generate] Done in ${((Date.now()-t)/1000).toFixed(1)}s`);
     res.json({ choices:[{message:{content}}] });
   } catch(err) { console.error('[generate] Error:', err.message); res.status(500).json({error:err.message}); }
