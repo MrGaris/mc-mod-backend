@@ -40,13 +40,15 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'MC Mod Compiler', java: getJavaVersion() });
 });
 
-// ── Groq proxy (keeps API key server-side) ────────────────────────────
+// ── Groq proxy — Qwen3-32b з режимом думання ─────────────────────────
 app.post('/generate', async (req, res) => {
   const { system, user } = req.body;
   if (!system || !user) return res.status(400).json({ error: 'Missing system or user' });
 
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) return res.status(500).json({ error: 'GROQ_API_KEY not set on server' });
+
+  const startTime = Date.now();
 
   try {
     const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -56,21 +58,49 @@ app.post('/generate', async (req, res) => {
         'Authorization': 'Bearer ' + apiKey
       },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model: 'qwen/qwen3-32b',
         messages: [
           { role: 'system', content: system },
           { role: 'user',   content: user   }
         ],
-        max_tokens: 8000,
-        temperature: 0.2
-      })
+        temperature: 0.6,
+        max_completion_tokens: 16000,
+        top_p: 0.95,
+        reasoning_effort: 'default'
+        // stream: false — ми не стрімимо, чекаємо повну відповідь
+      }),
+      signal: AbortSignal.timeout(180000) // 3 хв для reasoning моделі
     });
+
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.error?.message || 'Groq HTTP ' + r.status);
+    }
+
     const data = await r.json();
+
+    // Прибираємо <think>...</think> блоки — юзеру потрібен тільки код
+    if (data.choices?.[0]?.message?.content) {
+      data.choices[0].message.content = data.choices[0].message.content
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .trim();
+    }
+
+    // Мінімум 10 секунд
+    const elapsed = Date.now() - startTime;
+    if (elapsed < 10000) await sleep(10000 - elapsed);
+
+    console.log(`[generate] Done in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
     res.json(data);
+
   } catch (err) {
+    console.error('[generate] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 
 // POST /compile — with AI auto-fix loop
 app.post('/compile', async (req, res) => {
@@ -166,16 +196,21 @@ Rules: fix every error, keep same functionality, use only real ${loader} ${mcVer
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
     body: JSON.stringify({
-      model: 'llama-3.1-8b-instant',
+      model: 'qwen/qwen3-32b',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-      max_tokens: 8000, temperature: 0.1
+      temperature: 0.6,
+      max_completion_tokens: 16000,
+      top_p: 0.95,
+      reasoning_effort: 'default'
     }),
     signal: AbortSignal.timeout(60000)
   });
 
   if (!r.ok) throw new Error('Groq API error: ' + r.status);
   const data = await r.json();
-  const raw = data.choices?.[0]?.message?.content || '';
+  const rawWithThink = data.choices?.[0]?.message?.content || '';
+  // Strip <think> blocks — only need the code
+  const raw = rawWithThink.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 
   const fixed = {};
   const parts = raw.split(/\/\/ FILE: /);
