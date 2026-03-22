@@ -72,61 +72,124 @@ app.post('/generate', async (req, res) => {
   }
 });
 
-// POST /compile
-// Body: { modId, modName, loader, mcVersion, files: { "path": "content" } }
+// POST /compile — with AI auto-fix loop
 app.post('/compile', async (req, res) => {
   const { modId, modName, loader, mcVersion, files } = req.body;
-
-  if (!modId || !files || typeof files !== 'object') {
+  if (!modId || !files || typeof files !== 'object')
     return res.status(400).json({ error: 'Missing modId or files' });
+
+  const MAX_ATTEMPTS = 4; // 1 initial + 3 AI fix attempts
+  let currentFiles = { ...files };
+  let workDir = null;
+  let lastError = '';
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (workDir) { try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (_) {} }
+    workDir = path.join(os.tmpdir(), `mcmod_${Date.now()}_${modId}_a${attempt}`);
+
+    try {
+      console.log(`[compile] Attempt ${attempt}/${MAX_ATTEMPTS}: ${modId}`);
+      writeProjectFiles(workDir, modId, modName, loader, mcVersion, currentFiles);
+      await runGradle(workDir);
+
+      // Success
+      const libsDir = path.join(workDir, 'build', 'libs');
+      const jars = fs.readdirSync(libsDir)
+        .filter(f => f.endsWith('.jar') && !f.includes('sources') && !f.includes('javadoc'));
+      if (jars.length === 0) throw new Error('No JAR found after build');
+
+      const jarData = fs.readFileSync(path.join(libsDir, jars[0]));
+      console.log(`[compile] SUCCESS on attempt ${attempt}: ${jars[0]}`);
+
+      res.set({
+        'Content-Type': 'application/java-archive',
+        'Content-Disposition': `attachment; filename="${jars[0]}"`,
+        'Content-Length': jarData.length,
+        'X-Mod-Id': modId,
+        'X-Attempts': String(attempt),
+      });
+      res.send(jarData);
+      try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (_) {}
+      return;
+
+    } catch (err) {
+      lastError = err.message;
+      console.error(`[compile] Attempt ${attempt} FAILED:`, lastError.slice(0, 300));
+
+      if (attempt === MAX_ATTEMPTS) break;
+
+      // Ask AI to fix errors
+      console.log(`[compile] Asking AI to fix errors (attempt ${attempt})...`);
+      try {
+        const fixed = await aiFixErrors(currentFiles, lastError, loader, mcVersion);
+        if (fixed && Object.keys(fixed).length > 0) {
+          currentFiles = fixed;
+          console.log(`[compile] AI fixed: ${Object.keys(fixed).filter(k => k.endsWith('.java')).join(', ')}`);
+        } else {
+          console.warn('[compile] AI returned no fixes, stopping');
+          break;
+        }
+      } catch (aiErr) {
+        console.error('[compile] AI fix error:', aiErr.message);
+        break;
+      }
+    }
   }
 
-  const workDir = path.join(os.tmpdir(), 'mcmod_' + Date.now() + '_' + modId);
-
-  try {
-    console.log(`[compile] Starting: ${modId} (${loader} ${mcVersion})`);
-
-    // Write all project files
-    writeProjectFiles(workDir, modId, modName, loader, mcVersion, files);
-
-    // Make gradlew executable
-    const gradlew = path.join(workDir, 'gradlew');
-    if (fs.existsSync(gradlew)) fs.chmodSync(gradlew, '755');
-
-    // Run gradle build
-    console.log(`[compile] Running gradle build in ${workDir}`);
-    await runGradle(workDir);
-
-    // Find the JAR
-    const libsDir = path.join(workDir, 'build', 'libs');
-    const jars = fs.readdirSync(libsDir).filter(f => f.endsWith('.jar') && !f.includes('sources') && !f.includes('javadoc'));
-
-    if (jars.length === 0) throw new Error('No JAR found after build');
-
-    const jarPath = path.join(libsDir, jars[0]);
-    const jarData = fs.readFileSync(jarPath);
-
-    console.log(`[compile] Success: ${jars[0]} (${jarData.length} bytes)`);
-
-    res.set({
-      'Content-Type':        'application/java-archive',
-      'Content-Disposition': `attachment; filename="${jars[0]}"`,
-      'Content-Length':      jarData.length,
-      'X-Mod-Id':            modId,
-    });
-    res.send(jarData);
-
-  } catch (err) {
-    console.error(`[compile] Error:`, err.message);
-    res.status(500).json({
-      error: 'Compilation failed',
-      details: err.message.slice(0, 2000)
-    });
-  } finally {
-    // Cleanup
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (_) {}
-  }
+  try { if (workDir) fs.rmSync(workDir, { recursive: true, force: true }); } catch (_) {}
+  res.status(500).json({ error: 'Compilation failed after AI fixes', details: lastError.slice(0, 3000) });
 });
+
+// ── AI Error Fixer ────────────────────────────────────────────────────
+async function aiFixErrors(files, errorLog, loader, mcVersion) {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error('GROQ_API_KEY not set');
+
+  const javaFiles = Object.entries(files)
+    .filter(([p]) => p.endsWith('.java'))
+    .map(([p, c]) => `// FILE: ${p}\n${c}`)
+    .join('\n\n---\n\n');
+
+  const errorLines = errorLog.split('\n')
+    .filter(l => l.includes('error:') || l.includes('ERROR') || l.includes('FAILED') || l.includes('exception'))
+    .slice(0, 60).join('\n');
+
+  const sys = `You are a Minecraft mod compiler error fixer for ${loader} ${mcVersion}.
+Fix ALL compilation errors. Output ONLY corrected files:
+// FILE: src/main/java/path/ClassName.java
+[corrected java code]
+Rules: fix every error, keep same functionality, use only real ${loader} ${mcVersion} APIs, output ALL Java files.`;
+
+  const usr = `BUILD ERRORS:\n${errorLines}\n\nLAST ERROR LOG:\n${errorLog.slice(-2000)}\n\nSOURCE FILES:\n${javaFiles}`;
+
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+    body: JSON.stringify({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+      max_tokens: 8000, temperature: 0.1
+    }),
+    signal: AbortSignal.timeout(60000)
+  });
+
+  if (!r.ok) throw new Error('Groq API error: ' + r.status);
+  const data = await r.json();
+  const raw = data.choices?.[0]?.message?.content || '';
+
+  const fixed = {};
+  const parts = raw.split(/\/\/ FILE: /);
+  for (let i = 1; i < parts.length; i++) {
+    const nl = parts[i].indexOf('\n');
+    if (nl === -1) continue;
+    const fp = parts[i].slice(0, nl).trim();
+    const content = parts[i].slice(nl + 1).trim()
+      .replace(/^\`\`\`[a-z]*\n?/i, '').replace(/\n?\`\`\`\s*$/i, '').trim();
+    if (fp.endsWith('.java') && content) fixed[fp] = content;
+  }
+
+  return { ...files, ...fixed };
+}
 
 // ── Write all project files ──────────────────────────────────────────
 function writeProjectFiles(workDir, modId, modName, loader, mcVersion, generatedFiles) {
@@ -297,12 +360,15 @@ function writeFile(base, relPath, content) {
 // ── Run Gradle ───────────────────────────────────────────────────────
 function runGradle(workDir) {
   return new Promise((resolve, reject) => {
-    const gradlew = path.join(workDir, 'gradlew');
-    const cmd     = fs.existsSync(gradlew) ? gradlew : 'gradle';
-    const proc    = spawn(cmd, ['build', '--no-daemon', '--parallel', '--no-scan', '-x', 'test'], {
+    // Use system gradle (installed in Docker), skip wrapper
+    const proc = spawn('gradle', ['build', '--no-daemon', '--parallel', '--no-scan', '-x', 'test'], {
       cwd: workDir,
-      env: { ...process.env, GRADLE_USER_HOME: path.join(os.tmpdir(), 'gradle_cache') },
-      timeout: 8 * 60 * 1000 // 8 min timeout
+      env: {
+        ...process.env,
+        GRADLE_USER_HOME: path.join(os.tmpdir(), 'gradle_cache'),
+        JAVA_HOME: process.env.JAVA_HOME || '/opt/java/openjdk'
+      },
+      timeout: 8 * 60 * 1000
     });
 
     let out = '';
