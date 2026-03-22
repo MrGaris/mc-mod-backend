@@ -11,12 +11,67 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
+// ── Auto-install Java if missing ─────────────────────────────────────
+function ensureJava() {
+  try {
+    execSync('java -version 2>&1');
+    console.log('[java] Already installed:', execSync('java -version 2>&1').toString().split('\n')[0]);
+    return true;
+  } catch {
+    console.log('[java] Not found, installing...');
+    try {
+      execSync('apt-get update -qq && apt-get install -y openjdk-21-jdk-headless 2>&1', {
+        stdio: 'inherit', timeout: 5 * 60 * 1000
+      });
+      console.log('[java] Installed successfully');
+      return true;
+    } catch (e) {
+      console.error('[java] Install failed:', e.message);
+      return false;
+    }
+  }
+}
+
+// Run Java install on startup
+ensureJava();
+
 // ── Health check ─────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'MC Mod Compiler', java: getJavaVersion() });
 });
 
-// ── Compile endpoint ─────────────────────────────────────────────────
+// ── Groq proxy (keeps API key server-side) ────────────────────────────
+app.post('/generate', async (req, res) => {
+  const { system, user } = req.body;
+  if (!system || !user) return res.status(400).json({ error: 'Missing system or user' });
+
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'GROQ_API_KEY not set on server' });
+
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + apiKey
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user',   content: user   }
+        ],
+        max_tokens: 8000,
+        temperature: 0.2
+      })
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /compile
 // Body: { modId, modName, loader, mcVersion, files: { "path": "content" } }
 app.post('/compile', async (req, res) => {
