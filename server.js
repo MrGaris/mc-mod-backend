@@ -38,113 +38,67 @@ function getVersionConfig(loader, mcVersion) {
     neoV:      neoMap[mcVersion]    || '21.1.80',
     fabApiV:   fabApiMap[mcVersion] || '0.114.1+1.21.1',
     fabLoader: '0.16.10',
+    // fabric-loom 1.9-SNAPSHOT requires Gradle 8.11; NeoForge works on 8.10.2
     gradleV:   isFabric ? '8.11' : '8.10.2',
   };
 }
 
-// ── Groq AI ────────────────────────────────────────────────────────────
+// ── Google Gemini AI ──────────────────────────────────────────────────
 async function callAI(sys, usr) {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) throw new Error('GROQ_API_KEY not set');
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error('GEMINI_API_KEY not set');
 
-  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + key,
-    },
-    body: JSON.stringify({
-      model: 'moonshard-coder-v1',   // best Groq coding model; fallback below
-      messages: [
-        { role: 'system', content: sys },
-        { role: 'user',   content: usr }
-      ],
-      max_tokens: 16000,
-      temperature: 0.3,
-    }),
-    signal: AbortSignal.timeout(300000)
-  });
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${key}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: sys }] },
+        contents: [{ role: 'user', parts: [{ text: usr }] }],
+        generationConfig: {
+          maxOutputTokens: 16384,
+          temperature: 0.3,
+        }
+      }),
+      signal: AbortSignal.timeout(120000) // 2 хв
+    }
+  );
 
   if (!r.ok) {
     const e = await r.json().catch(() => ({}));
-    // If the requested model isn't available, try the universal fallback
-    if (r.status === 404 || r.status === 400) {
-      return callAIFallback(sys, usr, key);
-    }
-    throw new Error(e.error?.message || 'Groq HTTP ' + r.status);
+    throw new Error(e.error?.message || 'Gemini HTTP ' + r.status);
   }
 
   const d = await r.json();
-  return (d.choices?.[0]?.message?.content || '').trim();
-}
-
-// Fallback to a reliable Groq model
-async function callAIFallback(sys, usr, key) {
-  const MODELS = [
-    'llama-3.3-70b-versatile',
-    'llama3-70b-8192',
-    'mixtral-8x7b-32768',
-  ];
-
-  for (const model of MODELS) {
-    try {
-      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + key,
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: sys },
-            { role: 'user',   content: usr }
-          ],
-          max_tokens: 16000,
-          temperature: 0.3,
-        }),
-        signal: AbortSignal.timeout(300000)
-      });
-
-      if (!r.ok) continue;
-      const d = await r.json();
-      const content = (d.choices?.[0]?.message?.content || '').trim();
-      if (content) {
-        console.log(`[groq] Using fallback model: ${model}`);
-        return content;
-      }
-    } catch { continue; }
-  }
-
-  throw new Error('All Groq models failed. Check GROQ_API_KEY and account limits.');
+  const content = d.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  // Strip <think> blocks if any
+  return content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 }
 
 // ── Generate ──────────────────────────────────────────────────────────
 app.post('/generate', async (req, res) => {
-  const { system, user } = req.body;
-  if (!system || !user) return res.status(400).json({ error: 'Missing system or user' });
+  const {system,user} = req.body;
+  if (!system||!user) return res.status(400).json({error:'Missing system or user'});
   const t = Date.now();
   try {
     const content = await callAI(system, user);
     console.log(`[generate] Done in ${((Date.now()-t)/1000).toFixed(1)}s`);
-    res.json({ choices: [{ message: { content } }] });
-  } catch(err) {
-    console.error('[generate] Error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ choices:[{message:{content}}] });
+  } catch(err) { console.error('[generate] Error:', err.message); res.status(500).json({error:err.message}); }
 });
 
 // ── Compile with AI auto-fix loop ─────────────────────────────────────
 app.post('/compile', async (req, res) => {
-  const { modId, modName, loader, mcVersion, files } = req.body;
-  if (!modId || !files) return res.status(400).json({ error: 'Missing modId or files' });
+  const {modId,modName,loader,mcVersion,files} = req.body;
+  if (!modId||!files) return res.status(400).json({error:'Missing modId or files'});
 
   const MAX = 4;
-  let currentFiles = { ...files };
+  let currentFiles = {...files};
   let workDir = null, lastError = '';
 
-  for (let attempt = 1; attempt <= MAX; attempt++) {
-    if (workDir) { try { fs.rmSync(workDir, { recursive:true, force:true }); } catch {} }
+  for (let attempt=1; attempt<=MAX; attempt++) {
+    if (workDir) { try { fs.rmSync(workDir,{recursive:true,force:true}); } catch {} }
     workDir = path.join(os.tmpdir(), `mcmod_${Date.now()}_${modId}_a${attempt}`);
 
     try {
@@ -152,41 +106,36 @@ app.post('/compile', async (req, res) => {
       writeProjectFiles(workDir, modId, modName, loader, mcVersion, currentFiles);
       await runGradle(workDir, loader, mcVersion);
 
-      const libsDir = path.join(workDir, 'build', 'libs');
-      const jars = fs.readdirSync(libsDir).filter(f => f.endsWith('.jar') && !f.includes('sources') && !f.includes('javadoc'));
+      const libsDir = path.join(workDir,'build','libs');
+      const jars = fs.readdirSync(libsDir).filter(f=>f.endsWith('.jar')&&!f.includes('sources')&&!f.includes('javadoc'));
       if (!jars.length) throw new Error('No JAR found after build');
 
-      const jarData = fs.readFileSync(path.join(libsDir, jars[0]));
+      const jarData = fs.readFileSync(path.join(libsDir,jars[0]));
       console.log(`[compile] ✅ Success on attempt ${attempt}: ${jars[0]}`);
-      res.set({
-        'Content-Type': 'application/java-archive',
-        'Content-Disposition': `attachment; filename="${jars[0]}"`,
-        'Content-Length': jarData.length,
-        'X-Attempts': String(attempt)
-      });
+      res.set({'Content-Type':'application/java-archive','Content-Disposition':`attachment; filename="${jars[0]}"`,'Content-Length':jarData.length,'X-Attempts':String(attempt)});
       res.send(jarData);
-      try { fs.rmSync(workDir, { recursive:true, force:true }); } catch {}
+      try { fs.rmSync(workDir,{recursive:true,force:true}); } catch {}
       return;
 
     } catch(err) {
       lastError = err.message;
-      console.error(`[compile] ❌ Attempt ${attempt} FAILED:`, lastError.slice(0, 200));
-      if (attempt === MAX) break;
+      console.error(`[compile] ❌ Attempt ${attempt} FAILED:`, lastError.slice(0,200));
+      if (attempt===MAX) break;
       console.log(`[compile] 🤖 AI fixing (attempt ${attempt})...`);
       try { currentFiles = await aiFixErrors(currentFiles, lastError, loader, mcVersion); }
       catch(e) { console.error('[compile] AI fix failed:', e.message); break; }
     }
   }
-  try { if (workDir) fs.rmSync(workDir, { recursive:true, force:true }); } catch {}
-  res.status(500).json({ error: 'Compilation failed after AI fixes', details: lastError.slice(0, 3000) });
+  try { if (workDir) fs.rmSync(workDir,{recursive:true,force:true}); } catch {}
+  res.status(500).json({error:'Compilation failed after AI fixes', details:lastError.slice(0,3000)});
 });
 
 // ── AI error fixer ────────────────────────────────────────────────────
 async function aiFixErrors(files, errorLog, loader, mcVersion) {
-  const javaFiles = Object.entries(files).filter(([p]) => p.endsWith('.java'))
-    .map(([p, c]) => `// FILE: ${p}\n${c}`).join('\n\n---\n\n');
+  const javaFiles = Object.entries(files).filter(([p])=>p.endsWith('.java'))
+    .map(([p,c])=>`// FILE: ${p}\n${c}`).join('\n\n---\n\n');
   const errorLines = errorLog.split('\n')
-    .filter(l => /error:|ERROR|FAILED|exception|Cannot find/i.test(l)).slice(0, 80).join('\n');
+    .filter(l=>/error:|ERROR|FAILED|exception|Cannot find/i.test(l)).slice(0,80).join('\n');
 
   const sys = `You are a Minecraft mod compiler error fixer for ${loader} ${mcVersion}.
 Fix ALL compilation errors. Output ONLY corrected Java files:
@@ -198,29 +147,29 @@ Rules: fix every error, keep same functionality, use only real ${loader} ${mcVer
   const raw = await callAI(sys, usr);
   const fixed = parseFiles(raw);
   if (!Object.keys(fixed).length) throw new Error('AI returned no files');
-  return { ...files, ...fixed };
+  return {...files, ...fixed};
 }
 
 function parseFiles(raw) {
   const out = {};
   const parts = raw.split(/\/\/\s*FILE:\s*/);
-  for (let i = 1; i < parts.length; i++) {
-    const nl = parts[i].indexOf('\n'); if (nl === -1) continue;
-    const fp = parts[i].slice(0, nl).trim();
-    const c  = parts[i].slice(nl+1).trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-    if (fp && c) out[fp] = c;
+  for (let i=1;i<parts.length;i++) {
+    const nl = parts[i].indexOf('\n'); if (nl===-1) continue;
+    const fp = parts[i].slice(0,nl).trim();
+    const c  = parts[i].slice(nl+1).trim().replace(/^```[a-z]*\n?/i,'').replace(/\n?```\s*$/i,'').trim();
+    if (fp&&c) out[fp]=c;
   }
   return out;
 }
 
 // ── Write project files ───────────────────────────────────────────────
 function writeProjectFiles(workDir, modId, modName, loader, mcVersion, generatedFiles) {
-  fs.mkdirSync(workDir, { recursive:true });
-  const { isFabric, neoV, fabApiV, fabLoader, gradleV } = getVersionConfig(loader, mcVersion);
-  const pkg = `com.modgen.${modId.replace(/[^a-z0-9]/g, '')}`;
+  fs.mkdirSync(workDir,{recursive:true});
+  const {isFabric,neoV,fabApiV,fabLoader,gradleV} = getVersionConfig(loader,mcVersion);
+  const pkg = `com.modgen.${modId.replace(/[^a-z0-9]/g,'')}`;
   console.log(`[build] Gradle ${gradleV} | ${loader} ${mcVersion} | neoV=${neoV}`);
 
-  wf(workDir, 'gradle/wrapper/gradle-wrapper.properties',
+  wf(workDir,'gradle/wrapper/gradle-wrapper.properties',
 `distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
 distributionUrl=https\\://services.gradle.org/distributions/gradle-${gradleV}-bin.zip
@@ -229,12 +178,12 @@ validateDistributionUrl=true
 zipStoreBase=GRADLE_USER_HOME
 zipStorePath=wrapper/dists`);
 
-  wf(workDir, 'gradlew', '#!/bin/sh\nDIRNAME=$(cd "$(dirname "$0")" && pwd)\nexec java -jar "$DIRNAME/gradle/wrapper/gradle-wrapper.jar" "$@"');
-  fs.chmodSync(path.join(workDir, 'gradlew'), '755');
-  wf(workDir, 'gradlew.bat', '@echo off\njava -jar "%~dp0gradle\\wrapper\\gradle-wrapper.jar" %*');
+  wf(workDir,'gradlew','#!/bin/sh\nDIRNAME=$(cd "$(dirname "$0")" && pwd)\nexec java -jar "$DIRNAME/gradle/wrapper/gradle-wrapper.jar" "$@"');
+  fs.chmodSync(path.join(workDir,'gradlew'),'755');
+  wf(workDir,'gradlew.bat','@echo off\njava -jar "%~dp0gradle\\wrapper\\gradle-wrapper.jar" %*');
 
   if (isFabric) {
-    wf(workDir, 'settings.gradle',
+    wf(workDir,'settings.gradle',
 `pluginManagement {
     repositories {
         maven { url = 'https://maven.fabricmc.net/' }
@@ -243,7 +192,7 @@ zipStorePath=wrapper/dists`);
     }
 }
 rootProject.name = "${modId}"`);
-    wf(workDir, 'gradle.properties',
+    wf(workDir,'gradle.properties',
 `minecraft_version=${mcVersion}
 yarn_mappings=${mcVersion}+build.1
 loader_version=${fabLoader}
@@ -260,7 +209,7 @@ org.gradle.daemon=false
 org.gradle.parallel=true
 org.gradle.caching=true
 org.gradle.configuration-cache=false`);
-    wf(workDir, 'build.gradle',
+    wf(workDir,'build.gradle',
 `plugins {
     id 'fabric-loom' version '1.9-SNAPSHOT'
     id 'maven-publish'
@@ -278,7 +227,8 @@ dependencies {
 }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }`);
   } else {
-    wf(workDir, 'settings.gradle',
+    // NeoForge — exact match with uploaded template
+    wf(workDir,'settings.gradle',
 `pluginManagement {
     repositories {
         maven { url = 'https://maven-central.storage.googleapis.com' }
@@ -291,7 +241,7 @@ plugins {
     id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
 }
 rootProject.name = "${modId}"`);
-    wf(workDir, 'gradle.properties',
+    wf(workDir,'gradle.properties',
 `minecraft_version=${mcVersion}
 neo_version=${neoV}
 java_version=21
@@ -314,7 +264,7 @@ systemProp.org.gradle.internal.http.connectionTimeout=180000
 systemProp.org.gradle.internal.http.socketTimeout=180000
 systemProp.org.gradle.internal.repository.max.retries=5
 systemProp.org.gradle.internal.repository.initial.backoff=1000`);
-    wf(workDir, 'build.gradle',
+    wf(workDir,'build.gradle',
 `plugins {
     id 'java-library'
     id 'eclipse'
@@ -363,22 +313,22 @@ tasks.withType(Jar).configureEach {
   }
 
   // AI-generated files
-  for (const [fp, c] of Object.entries(generatedFiles)) wf(workDir, fp, c);
+  for (const [fp,c] of Object.entries(generatedFiles)) wf(workDir, fp, c);
 
   // Default configs if missing
-  const hasFabric = Object.keys(generatedFiles).some(f => f.includes('fabric.mod.json'));
-  const hasToml   = Object.keys(generatedFiles).some(f => f.includes('neoforge.mods.toml'));
+  const hasFabric = Object.keys(generatedFiles).some(f=>f.includes('fabric.mod.json'));
+  const hasToml   = Object.keys(generatedFiles).some(f=>f.includes('neoforge.mods.toml'));
 
   if (isFabric && !hasFabric) {
-    wf(workDir, 'src/main/resources/fabric.mod.json', JSON.stringify({
+    wf(workDir,'src/main/resources/fabric.mod.json', JSON.stringify({
       schemaVersion:1, id:modId, version:'1.0.0', name:modName,
       description:'Generated mod', authors:['ModGen'], environment:'*',
-      entrypoints:{ main:[`${pkg}.${modName}`] },
-      depends:{ fabricloader:`>=${fabLoader}`, 'fabric-api':'*', minecraft:mcVersion }
-    }, null, 2));
+      entrypoints:{main:[`${pkg}.${modName}`]},
+      depends:{fabricloader:`>=${fabLoader}`,'fabric-api':'*',minecraft:mcVersion}
+    },null,2));
   }
   if (!isFabric && !hasToml) {
-    wf(workDir, 'src/main/resources/META-INF/neoforge.mods.toml',
+    wf(workDir,'src/main/resources/META-INF/neoforge.mods.toml',
 `modLoader="javafml"
 loaderVersion="[4,)"
 license="All Rights Reserved"
@@ -405,7 +355,7 @@ description='''\${mod_description}'''
 
 function wf(base, relPath, content) {
   const full = path.join(base, relPath);
-  fs.mkdirSync(path.dirname(full), { recursive:true });
+  fs.mkdirSync(path.dirname(full),{recursive:true});
   fs.writeFileSync(full, content, 'utf8');
 }
 
@@ -413,25 +363,27 @@ function wf(base, relPath, content) {
 function runGradle(workDir, loader, mcVersion) {
   return new Promise((resolve, reject) => {
     const proc = spawn('gradle', [
-      'build', '--no-daemon', '--parallel', '--no-scan', '-x', 'test',
+      'build','--no-daemon','--parallel','--no-scan','-x','test',
     ], {
       cwd: workDir,
       env: {
         ...process.env,
-        GRADLE_USER_HOME: path.join(os.tmpdir(), 'gradle_cache'),
-        JAVA_HOME: process.env.JAVA_HOME || '/opt/java/openjdk',
+        GRADLE_USER_HOME: path.join(os.tmpdir(),'gradle_cache'),
+        JAVA_HOME: process.env.JAVA_HOME||'/opt/java/openjdk',
       },
-      timeout: 10 * 60 * 1000
+      timeout: 10*60*1000
     });
-    let out = '';
-    proc.stdout.on('data', d => { out += d; process.stdout.write(d); });
-    proc.stderr.on('data', d => { out += d; process.stderr.write(d); });
-    proc.on('close', code => {
-      if (code === 0) resolve(out);
+    let out='';
+    proc.stdout.on('data',d=>{out+=d;process.stdout.write(d);});
+    proc.stderr.on('data',d=>{out+=d;process.stderr.write(d);});
+    proc.on('close',code=>{
+      if (code===0) resolve(out);
       else reject(new Error(`Gradle exited with code ${code}\n\n${out.slice(-4000)}`));
     });
-    proc.on('error', reject);
+    proc.on('error',reject);
   });
 }
 
-app.listen(PORT, () => console.log(`MC Mod Compiler running on port ${PORT}`));
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+
+app.listen(PORT, ()=>console.log(`MC Mod Compiler running on port ${PORT}`));
